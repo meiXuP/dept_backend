@@ -3,7 +3,10 @@ import re
 import jwt
 import uuid
 import bcrypt
-import pymysql  # ADD THIS LINE
+import random
+import string
+import base64
+import pymysql
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
@@ -15,8 +18,10 @@ from flask_cors import CORS
 from flask_mail import Mail, Message
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, and_, or_
+from PIL import Image
+import io
 
-# Add this line right after imports
+# Install PyMySQL as MySQLdb
 pymysql.install_as_MySQLdb()
 
 # Load environment variables
