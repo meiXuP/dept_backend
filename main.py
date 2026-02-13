@@ -1617,6 +1617,7 @@ def background_image_upload_task(image_data, email, folder='profiles'):
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
+    global app
     """User registration with background processing for faster response"""
     data = request.get_json()
     
