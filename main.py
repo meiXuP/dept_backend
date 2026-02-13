@@ -21,6 +21,15 @@ from sqlalchemy import func, and_, or_
 from PIL import Image
 import io
 
+import smtplib
+import socket
+
+
+from threading import Thread
+from queue import Queue
+import concurrent.futures
+from flask import current_app
+
 # Install PyMySQL as MySQLdb
 pymysql.install_as_MySQLdb()
 
@@ -51,11 +60,22 @@ class Config:
         raise ValueError("DATABASE_URL must be set in environment")
     
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # SQLALCHEMY_ENGINE_OPTIONS = {
+    #     'pool_size': 10,
+    #     'pool_recycle': 3600,
+    #     'pool_pre_ping': True,
+    # }
+
+    # Memory optimization
     SQLALCHEMY_ENGINE_OPTIONS = {
-        'pool_size': 10,
+        'pool_size': 5,
         'pool_recycle': 3600,
         'pool_pre_ping': True,
+        'max_overflow': 2  # Reduce from 10
     }
+    
+    # Email timeout
+    MAIL_TIMEOUT = 30
     
     # Cloudinary Configuration
     CLOUDINARY_CLOUD_NAME = os.getenv('CLOUDINARY_CLOUD_NAME')
@@ -83,6 +103,8 @@ class Config:
     FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://127.0.0.1:5500')
 
 app.config.from_object(Config)
+
+
 
 # ==================== INITIALIZE EXTENSIONS ====================
 db = SQLAlchemy(app)
@@ -939,18 +961,35 @@ def get_department_stats():
 # ==================== EMAIL FUNCTIONS ====================
 
 def send_email(recipient, subject, template, **kwargs):
-    """Send email using SMTP"""
+    """Send email using SMTP with timeout handling"""
     try:
-        # template is already a formatted string from the email functions
+        # Format the template with kwargs
+        formatted_html = template.format(**kwargs)
+        
+        # Set timeout for email connection
+        app.config['MAIL_TIMEOUT'] = 30  # 30 seconds timeout
+        
         msg = Message(
             subject=subject,
             recipients=[recipient],
-            html=template,  # template is already formatted
+            html=formatted_html,
             sender=app.config['MAIL_DEFAULT_SENDER']
         )
+        
+        # Send with timeout
         mail.send(msg)
         print(f"Email sent successfully to {recipient}")
         return True
+        
+    except smtplib.SMTPAuthenticationError:
+        print(f"Email authentication error for {recipient}")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"SMTP error for {recipient}: {str(e)}")
+        return False
+    except socket.timeout:
+        print(f"Email timeout for {recipient}")
+        return False
     except Exception as e:
         print(f"Email error to {recipient}: {str(e)}")
         return False
@@ -1539,12 +1578,49 @@ def health_check():
 
 # ==================== AUTHENTICATION ROUTES ====================
 
+from threading import Thread
+from queue import Queue
+import concurrent.futures
+from flask import current_app
+
+# Create a thread pool executor for background tasks
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+
+def background_email_task(app, email, full_name, otp):
+    """Send email in background thread"""
+    with app.app_context():
+        try:
+            send_email(
+                email,
+                'Verify Your Email - CSE Department',
+                get_verification_email(full_name, otp)
+            )
+            print(f"Background email sent to {email}")
+        except Exception as e:
+            print(f"Background email error for {email}: {e}")
+
+def background_image_upload_task(image_data, email, folder='profiles'):
+    """Upload image in background thread"""
+    try:
+        if image_data and image_data.startswith('data:image'):
+            public_id = f"user_{email.split('@')[0]}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            avatar_url = process_and_upload_image(
+                image_data, 
+                folder,
+                public_id
+            )
+            print(f"Background image uploaded: {avatar_url}")
+            return avatar_url
+    except Exception as e:
+        print(f"Background image upload error: {e}")
+    return None
+
 @app.route('/api/auth/register', methods=['POST'])
 def register():
-    """User registration with proper image handling"""
+    """User registration with background processing for faster response"""
     data = request.get_json()
     
-    # Validate required fields
+    # Validate required fields (synchronous - fast operation)
     required_fields = ['email', 'password', 'fullName', 'userType', 'gender']
     for field in required_fields:
         if not data.get(field):
@@ -1560,48 +1636,27 @@ def register():
     if len(data['password']) < 6:
         return jsonify({'message': 'Password must be at least 6 characters'}), 400
     
-    # Check if user already exists
+    # Check if user already exists (synchronous - necessary for data integrity)
     existing_user = User.query.filter_by(email=email, is_deleted=False).first()
     if existing_user:
         return jsonify({'message': 'Email already registered'}), 409
     
-    # Check if already pending
+    # Check and cleanup pending user
     pending = PendingUser.query.filter_by(email=email).first()
     if pending:
         db.session.delete(pending)
         db.session.commit()
     
-    # Generate OTP
+    # Generate OTP (fast operation)
     otp = ''.join(random.choices(string.digits, k=6))
     
-    # Handle profile picture
-    avatar_url = None
-    if data.get('profilePic'):
-        try:
-            # Check if it's a valid base64 image
-            if data['profilePic'].startswith('data:image'):
-                # Process and upload to Cloudinary
-                public_id = f"user_{email.split('@')[0]}_{datetime.utcnow().strftime('%Y%m%d')}"
-                avatar_url = process_and_upload_image(
-                    data['profilePic'], 
-                    'profiles',
-                    public_id
-                )
-                print(f"Uploaded avatar: {avatar_url}")
-            else:
-                # Assume it's already a URL
-                avatar_url = data['profilePic']
-        except Exception as e:
-            print(f"Avatar processing error: {e}")
-            # Continue without avatar
-    
-    # Create pending user with avatar URL
+    # Create pending user WITHOUT avatar initially
     pending_user = PendingUser(
         email=email,
         full_name=data['fullName'].strip(),
         role=data['userType'],
         gender=data.get('gender'),
-        avatar=avatar_url,
+        avatar=None,  # Will be updated by background task
         otp_code=otp,
         otp_expiry=datetime.utcnow() + timedelta(minutes=app.config['OTP_EXPIRY_MINUTES'])
     )
@@ -1616,24 +1671,70 @@ def register():
     pending_user.registration_data = registration_data
     
     try:
+        # Save to database first (fast operation)
         db.session.add(pending_user)
         db.session.commit()
+        
+        # Get the current app context for background threads
+        app = current_app._get_current_object()
+        
+        # Start email sending in background
+        executor.submit(background_email_task, app, email, data['fullName'], otp)
+        
+        # Handle profile picture in background if present
+        if data.get('profilePic'):
+            def update_avatar_callback(future):
+                """Callback to update user with uploaded avatar URL"""
+                try:
+                    avatar_url = future.result()
+                    if avatar_url:
+                        with app.app_context():
+                            user = PendingUser.query.filter_by(email=email).first()
+                            if user:
+                                user.avatar = avatar_url
+                                db.session.commit()
+                                print(f"Avatar URL updated for {email}: {avatar_url}")
+                except Exception as e:
+                    print(f"Avatar update callback error: {e}")
+            
+            # Submit image upload task
+            future = executor.submit(
+                background_image_upload_task, 
+                data['profilePic'], 
+                email
+            )
+            # Add callback to update database
+            future.add_done_callback(update_avatar_callback)
+        
+        # Return immediate response
+        return jsonify({
+            'message': 'Registration initiated. Please verify your email.',
+            'email': email,
+            'status': 'processing',  # Indicate background tasks are running
+            'verification_sent': True  # Optimistic response
+        }), 201
+        
     except Exception as e:
         db.session.rollback()
         print(f"Database error during registration: {e}")
         return jsonify({'message': 'Registration failed. Please try again.'}), 500
-    
-    # Send OTP email
-    send_email(
-    email,
-    'Verify Your Email - CSE Department',
-    get_verification_email(data['fullName'], otp)  # The function returns complete HTML
-    )
+
+
+
+# For monitoring background tasks, you might want to add an endpoint:
+@app.route('/api/auth/registration-status/<email>', methods=['GET'])
+def registration_status(email):
+    """Check the status of background tasks for registration"""
+    pending_user = PendingUser.query.filter_by(email=email.lower().strip()).first()
+    if not pending_user:
+        return jsonify({'error': 'User not found'}), 404
     
     return jsonify({
-        'message': 'Registration initiated. Please verify your email.',
-        'email': email
-    }), 201
+        'email': email,
+        'avatar_uploaded': pending_user.avatar is not None,
+        'otp_expiry': pending_user.otp_expiry.isoformat() if pending_user.otp_expiry else None,
+        'status': 'pending_verification'
+    })
 
 
 @app.route('/api/auth/verify-email', methods=['POST'])
