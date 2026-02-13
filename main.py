@@ -60,11 +60,6 @@ class Config:
         raise ValueError("DATABASE_URL must be set in environment")
     
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    # SQLALCHEMY_ENGINE_OPTIONS = {
-    #     'pool_size': 10,
-    #     'pool_recycle': 3600,
-    #     'pool_pre_ping': True,
-    # }
 
     # Memory optimization
     SQLALCHEMY_ENGINE_OPTIONS = {
@@ -960,19 +955,16 @@ def get_department_stats():
 
 # ==================== EMAIL FUNCTIONS ====================
 
-def send_email(recipient, subject, template, **kwargs):
+def send_email(recipient, subject, template):
     """Send email using SMTP with timeout handling"""
-    try:
-        # Format the template with kwargs
-        formatted_html = template.format(**kwargs)
-        
+    try:        
         # Set timeout for email connection
         app.config['MAIL_TIMEOUT'] = 30  # 30 seconds timeout
         
         msg = Message(
             subject=subject,
             recipients=[recipient],
-            html=formatted_html,
+            html=template,
             sender=app.config['MAIL_DEFAULT_SENDER']
         )
         
@@ -1590,10 +1582,14 @@ def background_email_task(app, email, full_name, otp):
     """Send email in background thread"""
     with app.app_context():
         try:
+            # Get the email template with the parameters
+            email_html = get_verification_email(full_name, otp)
+            
+            # Send email with proper parameters
             send_email(
                 email,
                 'Verify Your Email - CSE Department',
-                get_verification_email(full_name, otp)
+                email_html
             )
             print(f"Background email sent to {email}")
         except Exception as e:
@@ -1866,14 +1862,12 @@ def verify_email():
     # Generate tokens for auto-login
     tokens = generate_tokens(user.id)
     
-    # Send welcome email
+    # Send welcome email - FIXED: Generate HTML first, then send
+    welcome_email_html = get_welcome_email(user.full_name, user.role, f"{app.config['FRONTEND_URL']}/#student-portal")
     send_email(
         user.email,
         'Welcome to CSE Department!',
-        get_welcome_email(user.full_name, user.role, f"{app.config['FRONTEND_URL']}/#student-portal"),
-        name=user.full_name,
-        role=user.role,
-        login_url=f"{app.config['FRONTEND_URL']}/#student-portal"
+        welcome_email_html
     )
     
     # Log activity
@@ -1910,13 +1904,12 @@ def resend_otp():
     otp = pending_user.generate_otp()
     db.session.commit()
     
-    # Send OTP email
+    # Send OTP email - FIXED: Generate HTML first, then send
+    otp_email_html = get_verification_email(pending_user.full_name, otp)
     send_email(
         email,
         'New Verification Code - CSE Department',
-        get_verification_email(pending_user.full_name, otp),
-        name=pending_user.full_name,
-        otp=otp
+        otp_email_html
     )
     
     return jsonify({'message': 'OTP resent successfully'}), 200
@@ -2078,13 +2071,12 @@ def forgot_password():
     
     db.session.commit()
     
-    # Send password reset email
+    # Send password reset email - FIXED: Generate HTML first, then send
+    forgot_password_html = get_forgot_password_email(user.full_name, otp)
     send_email(
         email,
         'Password Reset Request - CSE Department',
-        get_forgot_password_email(user.full_name, otp),
-        name=user.full_name,
-        otp=otp
+        forgot_password_html
     )
     
     return jsonify({'message': 'If email exists, reset link will be sent'}), 200
@@ -2534,22 +2526,19 @@ def register_for_event(current_user, event_id):
     db.session.add(registration)
     db.session.commit()
     
-    # Send confirmation email
+    # Send confirmation email - FIXED: Generate HTML first, then send
+    event_date_str = event.event_date.strftime('%B %d, %Y') if event.event_date else 'TBD'
+    event_email_html = get_event_notification_email(
+        current_user.full_name,
+        event.title,
+        event_date_str,
+        event.event_time,
+        event.location
+    )
     send_email(
         current_user.email,
         f'Registration Confirmed: {event.title}',
-        get_event_notification_email(
-            current_user.full_name,
-            event.title,
-            event.event_date.strftime('%B %d, %Y') if event.event_date else 'TBD',
-            event.event_time,
-            event.location
-        ),
-        name=current_user.full_name,
-        event_title=event.title,
-        event_date=event.event_date.strftime('%B %d, %Y') if event.event_date else 'TBD',
-        event_time=event.event_time,
-        event_location=event.location
+        event_email_html
     )
     
     log_activity(current_user.id, 'event_registered', 'event', event_id, {'event_title': event.title})
@@ -4206,12 +4195,11 @@ def send_updates(current_user):
     sent_count = 0
     for subscriber in subscribers:
         try:
+            newsletter_html = get_newsletter_email(subscriber.name or subscriber.email.split('@')[0], data['updates'])
             send_email(
                 subscriber.email,
                 'Department Updates - CSE Department',
-                get_newsletter_email(subscriber.name or subscriber.email.split('@')[0], data['updates']),
-                name=subscriber.name or subscriber.email.split('@')[0],
-                updates=data['updates']
+                newsletter_html
             )
             sent_count += 1
         except Exception as e:
@@ -4340,10 +4328,10 @@ if __name__ == '__main__':
     
     # Run app
     app.run(host='0.0.0.0', port=5000, debug=True)
-    
-    
-    
-    
+
+
+
+
 
 
 
