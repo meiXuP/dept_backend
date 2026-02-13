@@ -1,15 +1,9 @@
-"""
-Department Portal - Complete Flask Backend
-Tech Stack: Flask, MySQL, Cloudinary, SMTP
-Author: Department Portal System
-Version: 2.0 (Production Ready)
-"""
-
 import os
 import re
 import jwt
 import uuid
 import bcrypt
+import pymysql  # ADD THIS LINE
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
@@ -21,18 +15,16 @@ from flask_cors import CORS
 from flask_mail import Mail, Message
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, and_, or_
-import random
-import string
-import base64
-from PIL import Image
-import io
+
+# Add this line right after imports
+pymysql.install_as_MySQLdb()
 
 # Load environment variables
 load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, supports_credentials=True, origins=["http://127.0.0.1:5500", "http://localhost:5500"])
+CORS(app, supports_credentials=True, origins=["https://dip-mandal.github.io/dept_knu", "http://localhost:5500"])
 
 # ==================== CONFIGURATION ====================
 class Config:
