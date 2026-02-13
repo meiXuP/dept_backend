@@ -24,7 +24,7 @@ load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, supports_credentials=True, origins=["https://dip-mandal.github.io/dept_knu", "http://localhost:5500"])
+CORS(app, supports_credentials=True, origins=["https://dip-mandal.github.io", "http://localhost:5500"])
 
 # ==================== CONFIGURATION ====================
 class Config:
