@@ -38,7 +38,7 @@ load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, supports_credentials=True, origins=["https://dip-mandal.github.io", "http://localhost:5500"])
+CORS(app, supports_credentials=True, origins=["https://dip-mandal.github.io", "http://localhost:5500", "http://127.0.0.1:5500", "http://127.0.0.1:5000", "http://localhost:5000"])
 
 # ==================== CONFIGURATION ====================
 class Config:
@@ -1659,10 +1659,10 @@ def register():
     )
     pending_user.set_password(data['password'])
     
-    # Store additional registration data
+    # Store additional registration data - EXCLUDE registrationNo and employeeId
     registration_data = {}
     for k, v in data.items():
-        if k not in ['email', 'password', 'fullName', 'userType', 'gender', 'profilePic', 'confirmPassword']:
+        if k not in ['email', 'password', 'fullName', 'userType', 'gender', 'profilePic', 'confirmPassword', 'registrationNo', 'employeeId']:
             registration_data[k] = v
     
     pending_user.registration_data = registration_data
@@ -1704,17 +1704,34 @@ def register():
             future.add_done_callback(update_avatar_callback)
         
         # Return immediate response
-        return jsonify({
+        response = jsonify({
             'message': 'Registration initiated. Please verify your email.',
             'email': email,
             'status': 'processing',  # Indicate background tasks are running
             'verification_sent': True  # Optimistic response
-        }), 201
+        })
+        
+        # Add CORS headers
+        origin = request.headers.get('Origin')
+        if origin in ["https://dip-mandal.github.io", "http://localhost:5500", "http://127.0.0.1:5500"]:
+            response.headers.add('Access-Control-Allow-Origin', origin)
+            response.headers.add('Access-Control-Allow-Credentials', 'true')
+        
+        return response, 201
         
     except Exception as e:
         db.session.rollback()
         print(f"Database error during registration: {e}")
-        return jsonify({'message': 'Registration failed. Please try again.'}), 500
+        response = jsonify({'message': 'Registration failed. Please try again.'})
+        response.status_code = 500
+        
+        # Add CORS headers
+        origin = request.headers.get('Origin')
+        if origin in ["https://dip-mandal.github.io", "http://localhost:5500", "http://127.0.0.1:5500"]:
+            response.headers.add('Access-Control-Allow-Origin', origin)
+            response.headers.add('Access-Control-Allow-Credentials', 'true')
+        
+        return response
 
 
 
@@ -1745,140 +1762,203 @@ def verify_email():
     email = data['email'].lower().strip()
     otp = data['otp'].strip()
     
-    # Find pending user
-    pending_user = PendingUser.query.filter_by(email=email).first()
-    if not pending_user:
-        return jsonify({'message': 'No pending registration found'}), 404
-    
-    # Verify OTP
-    is_valid, reason = pending_user.verify_otp(otp)
-    
-    if not is_valid:
-        if pending_user.otp_attempts >= 5:
-            db.session.delete(pending_user)
-            db.session.commit()
-            return jsonify({'message': 'Too many failed attempts. Please register again.'}), 400
+    try:
+        # Find pending user
+        pending_user = PendingUser.query.filter_by(email=email).first()
+        if not pending_user:
+            return jsonify({'message': 'No pending registration found'}), 404
         
-        if reason == 'expired':
-            db.session.commit()
-            return jsonify({'message': 'OTP has expired. Please request a new one.'}), 400
+        # Verify OTP
+        is_valid, reason = pending_user.verify_otp(otp)
         
+        if not is_valid:
+            if pending_user.otp_attempts >= 5:
+                db.session.delete(pending_user)
+                db.session.commit()
+                return jsonify({'message': 'Too many failed attempts. Please register again.'}), 400
+            
+            if reason == 'expired':
+                db.session.commit()
+                return jsonify({'message': 'OTP has expired. Please request a new one.'}), 400
+            
+            db.session.commit()
+            return jsonify({'message': 'Invalid OTP'}), 400
+        
+        # Get registration data
+        reg_data = pending_user.registration_data or {}
+        
+        # Create actual user
+        user = User(
+            id=str(uuid.uuid4()),
+            email=pending_user.email,
+            full_name=pending_user.full_name,
+            role=pending_user.role,
+            gender=pending_user.gender,
+            avatar=pending_user.avatar,
+            is_verified=True
+        )
+        user.password_hash = pending_user.password_hash
+        
+        db.session.add(user)
+        db.session.flush()  # Get user ID
+        
+        # Create role-specific profile
+        if pending_user.role == 'student':
+            # Validate required student fields
+            course = reg_data.get('course')
+            year = reg_data.get('year')
+            semester = reg_data.get('semester')
+            
+            if not all([course, year, semester]):
+                db.session.rollback()
+                return jsonify({'message': 'Course, year, and semester are required for students'}), 400
+            
+            # Generate a unique registration number (ignore any from frontend)
+            reg_no = None
+            max_attempts = 20  # Increased attempts
+            
+            for attempt in range(max_attempts):
+                # Generate registration number in format: YY + 6 digits (e.g., 24123456)
+                year_prefix = datetime.utcnow().strftime('%y')
+                random_num = ''.join(random.choices(string.digits, k=6))
+                candidate_reg_no = f"{year_prefix}{random_num}"
+                
+                # Check if this registration number already exists
+                existing = Student.query.filter_by(registration_no=candidate_reg_no).first()
+                if not existing:
+                    reg_no = candidate_reg_no
+                    break
+            
+            if not reg_no:
+                # Fallback to timestamp-based registration number
+                timestamp = datetime.utcnow().strftime('%y%m%d%H%M%S')
+                random_suffix = ''.join(random.choices(string.digits, k=4))
+                reg_no = f"{timestamp}{random_suffix}"
+            
+            student = Student(
+                user_id=user.id,
+                registration_no=reg_no,
+                course=course,
+                year=int(year),
+                semester=int(semester),
+                caste=reg_data.get('caste')
+            )
+            db.session.add(student)
+            
+            print(f"Created student with registration number: {reg_no}")  # Debug log
+        
+        elif pending_user.role == 'teacher':
+            # Validate required teacher fields
+            designation = reg_data.get('designation')
+            qualification = reg_data.get('qualification')
+            
+            if not all([designation, qualification]):
+                db.session.rollback()
+                return jsonify({'message': 'Designation and qualification are required for teachers'}), 400
+            
+            # Generate a unique employee ID (ignore any from frontend)
+            emp_id = None
+            max_attempts = 20
+            
+            for attempt in range(max_attempts):
+                candidate_emp_id = f"FAC{datetime.utcnow().strftime('%y%m%d')}{random.randint(1000, 9999)}"
+                
+                # Check if this employee ID already exists
+                existing = Teacher.query.filter_by(employee_id=candidate_emp_id).first()
+                if not existing:
+                    emp_id = candidate_emp_id
+                    break
+            
+            if not emp_id:
+                # Fallback to UUID-based employee ID
+                emp_id = f"FAC{uuid.uuid4().hex[:10].upper()}"
+            
+            teacher = Teacher(
+                user_id=user.id,
+                employee_id=emp_id,
+                designation=designation,
+                qualification=qualification,
+                experience_years=int(reg_data.get('experienceYears', 0)),
+                specialization=reg_data.get('specialization'),
+                research_interests=reg_data.get('researchInterests'),
+                bio=reg_data.get('bio'),
+                office=reg_data.get('office'),
+                office_hours=reg_data.get('officeHours'),
+                linkedin=reg_data.get('linkedin'),
+                google_scholar=reg_data.get('googleScholar')
+            )
+            db.session.add(teacher)
+            
+            # Add to faculty list (public facing)
+            faculty = Faculty(
+                teacher_id=teacher.id,
+                name=user.full_name,
+                designation=designation,
+                qualification=qualification,
+                image=user.avatar,
+                expertise=reg_data.get('expertise', []),
+                email=user.email,
+                bio=reg_data.get('bio')
+            )
+            db.session.add(faculty)
+            
+            print(f"Created teacher with employee ID: {emp_id}")  # Debug log
+        
+        # Delete pending user
+        db.session.delete(pending_user)
         db.session.commit()
-        return jsonify({'message': 'Invalid OTP'}), 400
-    
-    # Generate registration number for students
-    reg_data = pending_user.registration_data or {}
-    
-    # Create actual user
-    user = User(
-        id=str(uuid.uuid4()),
-        email=pending_user.email,
-        full_name=pending_user.full_name,
-        role=pending_user.role,
-        gender=pending_user.gender,
-        avatar=pending_user.avatar,
-        is_verified=True
-    )
-    user.password_hash = pending_user.password_hash
-    
-    db.session.add(user)
-    db.session.flush()  # Get user ID
-    
-    # Create role-specific profile
-    if pending_user.role == 'student':
-        # Generate registration number if not provided
-        reg_no = reg_data.get('registrationNo')
-        if not reg_no:
-            year_prefix = datetime.utcnow().strftime('%Y')
-            random_num = ''.join(random.choices(string.digits, k=6))
-            reg_no = f"{year_prefix}{random_num}"
         
-        # Validate required student fields
-        course = reg_data.get('course')
-        year = reg_data.get('year')
-        semester = reg_data.get('semester')
+        # Generate tokens for auto-login
+        tokens = generate_tokens(user.id)
         
-        if not all([course, year, semester]):
-            db.session.rollback()
-            return jsonify({'message': 'Course, year, and semester are required for students'}), 400
-        
-        student = Student(
-            user_id=user.id,
-            registration_no=reg_no,
-            course=course,
-            year=int(year),
-            semester=int(semester),
-            caste=reg_data.get('caste')
+        # Send welcome email
+        welcome_email_html = get_welcome_email(user.full_name, user.role, f"{app.config['FRONTEND_URL']}/#student-portal")
+        send_email(
+            user.email,
+            'Welcome to CSE Department!',
+            welcome_email_html
         )
-        db.session.add(student)
-    
-    elif pending_user.role == 'teacher':
-        # Generate employee ID
-        emp_id = reg_data.get('employeeId')
-        if not emp_id:
-            emp_id = f"FAC{datetime.utcnow().strftime('%Y%m%d')}{random.randint(100, 999)}"
         
-        # Validate required teacher fields
-        designation = reg_data.get('designation')
-        qualification = reg_data.get('qualification')
+        # Log activity
+        log_activity(user.id, 'user_registered', 'user', user.id, {'email': user.email})
         
-        if not all([designation, qualification]):
-            db.session.rollback()
-            return jsonify({'message': 'Designation and qualification are required for teachers'}), 400
+        response = jsonify({
+            'message': 'Email verified successfully',
+            'accessToken': tokens['accessToken'],
+            'refreshToken': tokens['refreshToken'],
+            'user': user.to_dict()
+        })
         
-        teacher = Teacher(
-            user_id=user.id,
-            employee_id=emp_id,
-            designation=designation,
-            qualification=qualification,
-            experience_years=int(reg_data.get('experienceYears', 0)),
-            specialization=reg_data.get('specialization'),
-            research_interests=reg_data.get('researchInterests'),
-            bio=reg_data.get('bio'),
-            office=reg_data.get('office'),
-            office_hours=reg_data.get('officeHours'),
-            linkedin=reg_data.get('linkedin'),
-            google_scholar=reg_data.get('googleScholar')
-        )
-        db.session.add(teacher)
+        # Add CORS headers
+        origin = request.headers.get('Origin')
+        if origin in ["https://dip-mandal.github.io", "http://localhost:5500", "http://127.0.0.1:5500"]:
+            response.headers.add('Access-Control-Allow-Origin', origin)
+            response.headers.add('Access-Control-Allow-Credentials', 'true')
         
-        # Add to faculty list (public facing)
-        faculty = Faculty(
-            teacher_id=teacher.id,
-            name=user.full_name,
-            designation=designation,
-            qualification=qualification,
-            image=user.avatar,
-            expertise=reg_data.get('expertise', []),
-            email=user.email,
-            bio=reg_data.get('bio')
-        )
-        db.session.add(faculty)
-    
-    # Delete pending user
-    db.session.delete(pending_user)
-    db.session.commit()
-    
-    # Generate tokens for auto-login
-    tokens = generate_tokens(user.id)
-    
-    # Send welcome email - FIXED: Generate HTML first, then send
-    welcome_email_html = get_welcome_email(user.full_name, user.role, f"{app.config['FRONTEND_URL']}/#student-portal")
-    send_email(
-        user.email,
-        'Welcome to CSE Department!',
-        welcome_email_html
-    )
-    
-    # Log activity
-    log_activity(user.id, 'user_registered', 'user', user.id, {'email': user.email})
-    
-    return jsonify({
-        'message': 'Email verified successfully',
-        'accessToken': tokens['accessToken'],
-        'refreshToken': tokens['refreshToken'],
-        'user': user.to_dict()
-    }), 200
+        return response, 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in verify_email: {str(e)}")
+        
+        # Check if it's a duplicate registration number error
+        if "Duplicate entry" in str(e) and "registration_no" in str(e):
+            error_message = "Registration number already exists. Please try again."
+        elif "Duplicate entry" in str(e) and "employee_id" in str(e):
+            error_message = "Employee ID already exists. Please try again."
+        else:
+            error_message = "Verification failed. Please try again."
+        
+        response = jsonify({'message': error_message, 'error': str(e)})
+        response.status_code = 500
+        
+        # Add CORS headers
+        origin = request.headers.get('Origin')
+        if origin in ["https://dip-mandal.github.io", "http://localhost:5500", "http://127.0.0.1:5500"]:
+            response.headers.add('Access-Control-Allow-Origin', origin)
+            response.headers.add('Access-Control-Allow-Credentials', 'true')
+        
+        return response
 
 
 @app.route('/api/auth/resend-otp', methods=['POST'])
@@ -4328,7 +4408,6 @@ if __name__ == '__main__':
     
     # Run app
     app.run(host='0.0.0.0', port=5000, debug=True)
-
 
 
 
